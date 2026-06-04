@@ -3153,3 +3153,2055 @@ Layer	Tool	Content	Primary audience
 Human	Insight panel (Vue)	Step-by-step B1 Dutch reasoning with hyperlinks	Policymakers, spatial planners
 Machine	MLflow	Params, metrics, artifacts, Flesch-Douma, dataset versions, per-node latency	Developers, Woo auditors
 Citeable	ScenarioCard	scenario_id, hash, stable URL, citation string, git commit, dataset versions	Legal/admin use, advice letters
+
+
+
+19.2 GAP 2 — Shared scenario library, stable URLs, dataset version tracking & "same question = same answer"
+Problem
+
+Colleagues working in different sessions get different answers to the same policy question due to LLM temperature variability and dataset drift. There is no way to share a scenario artifact with a stable reference, and no warning when underlying data changes after a scenario was computed.
+Implementation
+Scenario hash computation (src/backend/utils/scenario_hash.py)
+
+Python
+
+import hashlib
+import json
+from src.backend.models.scenario import ScenarioParams
+
+def compute_scenario_hash(params: ScenarioParams) -> str:
+    """
+    Deterministic SHA-256 hash of normalized scenario parameters.
+    Same params → same hash → same cached result.
+    Normalization: sort all dict keys, lowercase strings, 
+    round floats to 4 decimal places.
+    """
+    def normalize(obj):
+        if isinstance(obj, dict):
+            return {k: normalize(v) for k, v in sorted(obj.items())}
+        elif isinstance(obj, list):
+            return [normalize(i) for i in obj]
+        elif isinstance(obj, float):
+            return round(obj, 4)
+        elif isinstance(obj, str):
+            return obj.lower().strip()
+        return obj
+
+    normalized = normalize(params.__dict__)
+    serialized = json.dumps(normalized, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:32]
+
+DuckDB scenario store schema (src/backend/cache/scenario_store.py)
+
+Python
+
+CREATE_SCENARIOS_TABLE = """
+CREATE TABLE IF NOT EXISTS scenarios (
+    scenario_id     VARCHAR PRIMARY KEY,
+    scenario_hash   VARCHAR NOT NULL,
+    params_json     JSON NOT NULL,
+    result_json     JSON NOT NULL,
+    dataset_versions JSON NOT NULL,   -- {table_name: last_modified_iso}
+    git_commit      VARCHAR NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    stable_url      VARCHAR NOT NULL,
+    is_citizen_mode BOOLEAN DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS idx_scenario_hash ON scenarios(scenario_hash);
+"""
+
+class ScenarioStore:
+    def __init__(self, conn):
+        self.conn = conn
+        conn.execute(CREATE_SCENARIOS_TABLE)
+
+    def get_by_hash(self, scenario_hash: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT result_json, dataset_versions, created_at, scenario_id, stable_url "
+            "FROM scenarios WHERE scenario_hash = ? ORDER BY created_at DESC LIMIT 1",
+            [scenario_hash]
+        ).fetchone()
+        if row:
+            return {
+                "result_json": row[0],
+                "dataset_versions_at_cache": row[1],
+                "cached_at": row[2],
+                "scenario_id": row[3],
+                "stable_url": row[4]
+            }
+        return None
+
+    def get_by_id(self, scenario_id: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT result_json, dataset_versions, created_at, stable_url "
+            "FROM scenarios WHERE scenario_id = ?",
+            [scenario_id]
+        ).fetchone()
+        if row:
+            return {
+                "result_json": row[0],
+                "dataset_versions_at_cache": row[1],
+                "cached_at": row[2],
+                "stable_url": row[3]
+            }
+        return None
+
+    def set(
+        self,
+        scenario_id: str,
+        scenario_hash: str,
+        params: dict,
+        result: dict,
+        dataset_versions: dict,
+        git_commit: str,
+        stable_url_base: str,
+        is_citizen_mode: bool = False
+    ):
+        stable_url = f"{stable_url_base}/scenario/{scenario_id}"
+        self.conn.execute(
+            """INSERT INTO scenarios 
+               (scenario_id, scenario_hash, params_json, result_json,
+                dataset_versions, git_commit, stable_url, is_citizen_mode)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (scenario_id) DO NOTHING""",
+            [scenario_id, scenario_hash, json.dumps(params),
+             json.dumps(result), json.dumps(dataset_versions),
+             git_commit, stable_url, is_citizen_mode]
+        )
+
+Dataset version drift detection (src/backend/utils/version_drift.py)
+
+Python
+
+def detect_version_drift(
+    dataset_versions_at_cache: dict,
+    current_dataset_versions: dict
+) -> list[dict]:
+    """
+    Compare dataset versions at cache time vs now.
+    Returns list of drifted tables with old/new timestamps.
+    """
+    drifted = []
+    for table, cached_version in dataset_versions_at_cache.items():
+        current = current_dataset_versions.get(table)
+        if current and current != cached_version:
+            drifted.append({
+                "table": table,
+                "cached_version": cached_version,
+                "current_version": current,
+                "warning_nl": (
+                    f"Let op: tabel '{table}' is bijgewerkt sinds dit scenario "
+                    f"werd berekend ({cached_version} → {current}). "
+                    f"Herbereken voor actuele uitkomst."
+                )
+            })
+    return drifted
+
+GET endpoint for stable scenario retrieval (src/backend/routers/scenario_router.py)
+
+Python
+
+@router.get("/scenario/{scenario_id}")
+async def get_scenario_by_id(scenario_id: str):
+    """
+    Stable URL for a cached scenario artifact.
+    Always returns the same ScenarioCard for the same scenario_id.
+    Adds version drift warning if datasets have changed since caching.
+    """
+    cached = scenario_store.get_by_id(scenario_id)
+    if not cached:
+        raise HTTPException(status_code=404, detail="Scenario niet gevonden.")
+    
+    current_versions = get_current_dataset_versions(conn)
+    drift = detect_version_drift(
+        cached["dataset_versions_at_cache"],
+        current_versions
+    )
+    result = json.loads(cached["result_json"])
+    result["cache_used"] = True
+    result["cached_at"] = cached["cached_at"].isoformat()
+    result["dataset_version_drift"] = drift
+    return result
+
+"Verify calculation" button handler
+
+Python
+
+@router.post("/scenario/{scenario_id}/verify")
+async def verify_scenario(scenario_id: str):
+    """
+    Re-runs the scenario with the same params but current dataset versions.
+    Returns new ScenarioCard + diff from cached version.
+    """
+    cached = scenario_store.get_by_id(scenario_id)
+    if not cached:
+        raise HTTPException(status_code=404, detail="Scenario niet gevonden.")
+    
+    original_params = ScenarioParams(**json.loads(cached["result_json"])["params"])
+    
+    # Re-run via the same pipeline
+    new_card = await run_scenario_pipeline(original_params)
+    
+    # Compute diff
+    original_results = json.loads(cached["result_json"])["results"]
+    diff = {
+        "supply_gap_delta": new_card.results.supply_gap_m3 - original_results["supply_gap_m3"],
+        "feasibility_changed": (
+            new_card.results.feasibility_class != original_results["feasibility_class"]
+        ),
+        "onset_year_delta": (
+            (new_card.results.onset_year or 0) - (original_results.get("onset_year") or 0)
+        ),
+        "recalculated_at": datetime.utcnow().isoformat(),
+        "summary_nl": _build_verify_summary_nl(original_results, new_card.results)
+    }
+    return {"new_card": new_card, "diff_from_cached": diff}
+
+Frontend: ScenarioSharePanel.vue
+
+vue
+
+<template>
+  <div class="scenario-share-panel">
+    <div class="share-row">
+      <span class="label">Stabiele URL:</span>
+      <a :href="stableUrl" target="_blank">{{ stableUrl }}</a>
+      <button @click="copyUrl">📋 Kopieer</button>
+    </div>
+    <div class="share-row">
+      <span class="label">Scenario-ID:</span>
+      <code>{{ scenarioId }}</code>
+    </div>
+    <div v-if="driftWarnings.length > 0" class="drift-warnings">
+      <div
+        v-for="w in driftWarnings"
+        :key="w.table"
+        class="drift-warning-banner"
+      >
+        ⚠️ {{ w.warning_nl }}
+        <button @click="verifyScenario">Herbereken</button>
+      </div>
+    </div>
+    <button
+      v-if="driftWarnings.length === 0"
+      @click="verifyScenario"
+      class="verify-btn"
+    >
+      🔄 Herbereken met actuele data
+    </button>
+  </div>
+</template>
+
+19.3 GAP 3 — Citation block: APA-format citation, stable URL, dataset versions, PDF export
+Problem
+
+When a policy officer cites scenario output in an advice letter or memo, there is no standard citation string, no PDF export, and no way to verify which data version was used.
+Implementation
+Citation builder (src/backend/utils/citation_builder.py)
+
+Python
+
+from datetime import datetime
+from src.backend.models.scenario import ScenarioCard
+
+def build_citation(card: ScenarioCard) -> dict:
+    """
+    Builds APA-style citation strings (English and Dutch) for a ScenarioCard.
+    """
+    date_nl = datetime.fromisoformat(card.created_at).strftime("%-d %B %Y")
+    date_en = datetime.fromisoformat(card.created_at).strftime("%B %-d, %Y")
+    short_id = card.scenario_id[:8]
+    scenario_label = _build_scenario_label_nl(card.params)
+
+    apa_nl = (
+        f"Provincie Zuid-Holland Ruimtelijke Assistent. "
+        f"({date_nl}). "
+        f"Scenario: {scenario_label} "
+        f"[Scenario-ID: {short_id}]. "
+        f"GovTechNL OneGov #2 — Drinkwaterzekerheid. "
+        f"Ophaalbaar via: {card.stable_url}"
+    )
+
+    apa_en = (
+        f"Province of Zuid-Holland Spatial Assistant. "
+        f"({date_en}). "
+        f"Scenario: {scenario_label} "
+        f"[Scenario ID: {short_id}]. "
+        f"GovTechNL OneGov #2 — Drinking Water Security. "
+        f"Retrieved from: {card.stable_url}"
+    )
+
+    metadata_block = (
+        f"Scenario-ID: {card.scenario_id}\n"
+        f"Scenario-hash: {card.scenario_hash}\n"
+        f"Gegenereerd: {date_nl}\n"
+        f"Software: onegov2-spatial-assistant @ {card.git_commit}\n"
+        f"Dataversies:\n" +
+        "\n".join(
+            f"  - {tbl}: {ver}"
+            for tbl, ver in card.dataset_versions.items()
+        )
+    )
+
+    return {
+        "apa_nl": apa_nl,
+        "apa_en": apa_en,
+        "metadata_block": metadata_block,
+        "stable_url": card.stable_url,
+        "scenario_id": card.scenario_id,
+        "git_commit": card.git_commit,
+        "dataset_versions": card.dataset_versions,
+        "generated_at": card.created_at
+    }
+
+def _build_scenario_label_nl(params) -> str:
+    """Builds a human-readable Dutch scenario label from params."""
+    type_labels = {
+        "drop_pin": "Ruimtelijke vraag",
+        "intake_failure": "Inname-uitval",
+        "multi_hazard": "Gecombineerd risico",
+        "intervention": "Interventiescenario"
+    }
+    base = type_labels.get(params.scenario_type, params.scenario_type)
+    parts = [base]
+    if params.knmi_preset and params.knmi_preset != "B":
+        parts.append(f"KNMI {params.knmi_preset}")
+    if params.time_horizon:
+        parts.append(str(params.time_horizon))
+    if params.intake_id:
+        parts.append(params.intake_id.replace("_", " ").title())
+    return ", ".join(parts)
+
+PDF export endpoint (src/backend/routers/scenario_router.py)
+
+Python
+
+from fpdf import FPDF
+import io
+
+@router.get("/scenario/{scenario_id}/pdf")
+async def export_scenario_pdf(scenario_id: str):
+    """
+    Generates a PDF export of the ScenarioCard suitable for
+    attachment to an official advice letter (adviesnota).
+    """
+    cached = scenario_store.get_by_id(scenario_id)
+    if not cached:
+        raise HTTPException(status_code=404, detail="Scenario niet gevonden.")
+
+    card_dict = json.loads(cached["result_json"])
+    citation = build_citation_from_dict(card_dict)
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    # Header
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "Scenario-uitvoer — Drinkwaterzekerheid ZH", ln=True)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, f"Gegenereerd: {card_dict['created_at']}", ln=True)
+    pdf.cell(0, 6, f"Scenario-ID: {card_dict['scenario_id']}", ln=True)
+    pdf.ln(4)
+
+    # Feasibility
+    pdf.set_font("Helvetica", "B", 13)
+    fc = card_dict["results"]["feasibility_class"]
+    fc_label = {"GO": "HAALBAAR", "CAUTION": "RISICO", "STOP": "NIET HAALBAAR"}.get(fc, fc)
+    pdf.cell(0, 8, f"Haalbaarheid: {fc_label}", ln=True)
+    pdf.ln(2)
+
+    # Key results
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 7, "Kernresultaten", ln=True)
+    pdf.set_font("Helvetica", "", 10)
+    results = card_dict["results"]
+    pdf.multi_cell(0, 6,
+        f"Dagelijkse vraag: {results['daily_demand_m3']:,.0f} m³/dag "
+        f"({results.get('human_scale', {}).get('analogy_nl', '')})"
+    )
+    pdf.multi_cell(0, 6,
+        f"Beschikbare capaciteit: {results['supply_capacity_m3']:,.0f} m³/dag"
+    )
+    gap = results["supply_gap_m3"]
+    gap_label = f"Tekort: {abs(gap):,.0f} m³/dag" if gap < 0 else f"Overschot: {gap:,.0f} m³/dag"
+    pdf.multi_cell(0, 6, gap_label)
+    if results.get("onset_year"):
+        pdf.multi_cell(0, 6, f"Verwacht aanvangsjaar tekort: {results['onset_year']}")
+    pdf.ln(3)
+
+    # Assumptions
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 7, "Aannames", ln=True)
+    pdf.set_font("Helvetica", "", 9)
+    for assumption in card_dict.get("assumptions", []):
+        pdf.multi_cell(0, 5,
+            f"• {assumption['label_nl']}: {assumption['value']} {assumption['unit']} "
+            f"(bandbreedte: {assumption['value_min']}–{assumption['value_max']}) "
+            f"— {assumption['source_label']}"
+        )
+    pdf.ln(3)
+
+    # Reasoning steps
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 7, "Redeneerproces", ln=True)
+    pdf.set_font("Helvetica", "", 9)
+    for step in card_dict.get("reasoning_steps", []):
+        pdf.multi_cell(0, 5, f"Stap {step['step_nr']}: {step['label_nl']}")
+        pdf.multi_cell(0, 5, f"  {step['description_nl']}")
+    pdf.ln(3)
+
+    # Citation block
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 7, "Citaat", ln=True)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.multi_cell(0, 5, citation["apa_nl"])
+    pdf.ln(2)
+    pdf.multi_cell(0, 5, citation["metadata_block"])
+
+    # Disclaimer
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.multi_cell(0, 5,
+        "Dit scenario is een beleidsmatige verkenning gegenereerd door de OneGov #2 "
+        "Ruimtelijke Assistent. Het is geen officiële meting of besluit. "
+        "Alle aannames en bronnen zijn vermeld. Voor officieel beleid, "
+        "zie het Regionaal Waterprogramma Zuid-Holland 2022–2027."
+    )
+
+    pdf_bytes = pdf.output(dest="S").encode("latin-1")
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename=scenario_{scenario_id[:8]}.pdf"
+        }
+    )
+
+Frontend: CitationBlock.vue
+
+vue
+
+<template>
+  <div class="citation-block">
+    <h4>📎 Citaat voor gebruik in adviesdocumenten</h4>
+    <div class="citation-meta">
+      <div class="meta-row">
+        <span class="meta-label">Scenario-ID:</span>
+        <code>{{ citation.scenario_id }}</code>
+      </div>
+      <div class="meta-row">
+        <span class="meta-label">Gegenereerd:</span>
+        <span>{{ formatDateNl(citation.generated_at) }}</span>
+      </div>
+      <div class="meta-row">
+        <span class="meta-label">Software:</span>
+        <code>onegov2-spatial-assistant @ {{ citation.git_commit }}</code>
+      </div>
+      <div class="meta-row">
+        <span class="meta-label">Dataversies:</span>
+        <ul class="version-list">
+          <li v-for="(ver, tbl) in citation.dataset_versions" :key="tbl">
+            <strong>{{ tbl }}</strong>: {{ ver }}
+          </li>
+        </ul>
+      </div>
+      <div class="meta-row">
+        <span class="meta-label">Stabiele URL:</span>
+        <a :href="citation.stable_url" target="_blank">{{ citation.stable_url }}</a>
+      </div>
+    </div>
+    <div class="citation-text">
+      <p class="citation-apa">{{ citation.apa_nl }}</p>
+    </div>
+    <div class="citation-actions">
+      <button @click="copyApa">📋 Kopieer citaat</button>
+      <a :href="pdfUrl" target="_blank">
+        <button>📄 Download PDF</button>
+      </a>
+      <button @click="copyUrl">🔗 Deel URL</button>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { computed } from 'vue'
+
+const props = defineProps({
+  citation: { type: Object, required: true },
+  scenarioId: { type: String, required: true }
+})
+
+const pdfUrl = computed(() =>
+  `/scenario/${props.scenarioId}/pdf`
+)
+
+const copyApa = () =>
+  navigator.clipboard.writeText(props.citation.apa_nl)
+
+const copyUrl = () =>
+  navigator.clipboard.writeText(props.citation.stable_url)
+
+const formatDateNl = (iso) => {
+  const d = new Date(iso)
+  return d.toLocaleDateString('nl-NL', {
+    day: 'numeric', month: 'long', year: 'numeric',
+    hour: '2-digit', minute: '2-digit'
+  })
+}
+</script>
+
+19.4 GAP 4 — Human-scale contextualization of every headline metric
+Problem
+
+"169,000 m³/dag" is meaningless to a policymaker, spatial planner, or citizen. Every headline metric must be accompanied by a real-world analogy with a cited conversion reference.
+Implementation
+Human-scale converter (src/backend/utils/human_scale.py)
+
+Python
+
+from dataclasses import dataclass
+from typing import Optional
+
+# Conversion constants with authoritative sources
+VEWIN_PERSON_DAY_M3 = 0.119      # m³/person/day (VEWIN Waterstatistiek)
+VEWIN_HOUSEHOLD_DAY_M3 = 0.35    # m³/household/day (VEWIN, CBS gemiddeld)
+CBS_AVG_HOUSEHOLD_SIZE = 2.2     # persons/household (CBS 2023)
+VEWIN_SOURCE_URL = "https://www.vewin.nl/publicaties/waterstatistiek"
+CBS_SOURCE_URL = "https://www.cbs.nl/nl-nl/maatwerk/2023/huishoudensgrootte"
+
+METRIC_CONVERSIONS = {
+    "daily_demand_m3": {
+        "divisor": VEWIN_PERSON_DAY_M3,
+        "unit_nl": "mensen",
+        "template": "dagelijks verbruik van ~{n} {unit}",
+        "source_url": VEWIN_SOURCE_URL,
+        "source_label": "VEWIN Waterstatistiek"
+    },
+    "supply_gap_m3": {
+        "divisor": VEWIN_HOUSEHOLD_DAY_M3,
+        "unit_nl": "huishoudens",
+        "template": "equivalent aan ~{n} {unit} zonder water",
+        "source_url": VEWIN_SOURCE_URL,
+        "source_label": "VEWIN Waterstatistiek"
+    },
+    "supply_capacity_m3": {
+        "divisor": VEWIN_PERSON_DAY_M3,
+        "unit_nl": "mensen",
+        "template": "leveringscapaciteit voor ~{n} {unit}",
+        "source_url": VEWIN_SOURCE_URL,
+        "source_label": "VEWIN Waterstatistiek"
+    },
+    "capacity_remaining_m3": {
+        "divisor": VEWIN_HOUSEHOLD_DAY_M3,
+        "unit_nl": "extra huishoudens",
+        "template": "ruimte voor ~{n} {unit}",
+        "source_url": VEWIN_SOURCE_URL,
+        "source_label": "VEWIN Waterstatistiek"
+    },
+    "development_delta_m3": {
+        "divisor": VEWIN_HOUSEHOLD_DAY_M3,
+        "unit_nl": "woningen",
+        "template": "extra vraag gelijk aan ~{n} {unit}",
+        "source_url": VEWIN_SOURCE_URL,
+        "source_label": "VEWIN Waterstatistiek"
+    }
+}
+
+@dataclass
+class HumanScaleRef:
+    metric_key: str
+    metric_value: float
+    metric_unit: str
+    analogy_nl: str
+    analogy_source_url: str
+    analogy_source_label: str
+    is_policy_approx: bool = True
+
+def to_human_scale(
+    metric_key: str,
+    value: float,
+    unit: str,
+    assumption_override_divisor: Optional[float] = None
+) -> HumanScaleRef:
+    """
+    Converts a raw metric to a human-scale analogy.
+    Raises ValueError if metric_key is not in METRIC_CONVERSIONS
+    (prevents silent empty-source failures).
+    """
+    if metric_key not in METRIC_CONVERSIONS:
+        raise ValueError(
+            f"No human-scale conversion defined for metric '{metric_key}'. "
+            f"Add an entry to METRIC_CONVERSIONS or handle explicitly."
+        )
+
+    conv = METRIC_CONVERSIONS[metric_key]
+    divisor = assumption_override_divisor or conv["divisor"]
+    n = int(abs(value) / divisor)
+    n_formatted = f"{n:,}".replace(",", ".")
+
+    analogy = conv["template"].format(n=n_formatted, unit=conv["unit_nl"])
+
+    return HumanScaleRef(
+        metric_key=metric_key,
+        metric_value=value,
+        metric_unit=unit,
+        analogy_nl=analogy,
+        analogy_source_url=conv["source_url"],
+        analogy_source_label=conv["source_label"],
+        is_policy_approx=True
+    )
+
+def attach_human_scale_refs(
+    results: dict,
+    demand_per_dwelling_override: Optional[float] = None
+) -> dict:
+    """
+    Attaches HumanScaleRef to every headline metric in results.
+    Called by format_scenario_output node.
+    """
+    human_scale_refs = {}
+    for key in [
+        "daily_demand_m3", "supply_gap_m3", "supply_capacity_m3",
+        "capacity_remaining_m3", "development_delta_m3"
+    ]:
+        if results.get(key) is not None:
+            try:
+                override = (
+                    demand_per_dwelling_override
+                    if key in ("supply_gap_m3", "capacity_remaining_m3", "development_delta_m3")
+                    else None
+                )
+                human_scale_refs[key] = to_human_scale(
+                    key, results[key], "m³/dag", override
+                ).__dict__
+            except ValueError as e:
+                # Log but don't silently suppress — show "no conversion" label
+                human_scale_refs[key] = {
+                    "analogy_nl": "Geen omrekening beschikbaar",
+                    "analogy_source_url": "/methodology",
+                    "analogy_source_label": "Zie methodologiedocument",
+                    "is_policy_approx": True,
+                    "error": str(e)
+                }
+    results["human_scale_refs"] = human_scale_refs
+    return results
+
+Frontend: HumanScaleRef.vue
+
+vue
+
+<template>
+  <span class="human-scale-ref">
+    <span class="analogy">≈ {{ ref.analogy_nl }}</span>
+    <a
+      :href="ref.analogy_source_url"
+      target="_blank"
+      class="source-link"
+      :title="ref.analogy_source_label"
+    >
+      ⓘ
+    </a>
+    <span v-if="ref.is_policy_approx" class="approx-label">
+      (beleidsmatige schatting)
+    </span>
+  </span>
+</template>
+
+<script setup>
+defineProps({
+  ref: { type: Object, required: true }
+})
+</script>
+
+Usage in MetricCard.vue
+
+vue
+
+<template>
+  <div class="metric-card">
+    <div class="metric-value">
+      {{ formatValue(value) }} <span class="metric-unit">{{ unit }}</span>
+    </div>
+    <HumanScaleRef
+      v-if="humanScaleRef"
+      :ref="humanScaleRef"
+    />
+  </div>
+</template>
+
+19.5 GAP 5 — "Make it feasible" intervention ranking
+Problem
+
+When a scenario returns STOP or CAUTION, policymakers and developers need to know not just that it's infeasible but what specific interventions would change the outcome, ranked by effectiveness and cost.
+Implementation
+Intervention ranker (src/backend/calculators/intervention_ranker.py)
+
+Python
+
+from dataclasses import dataclass
+from typing import List
+from src.backend.models.scenario import ScenarioResults, ScenarioParams
+from src.backend.calculators.demand import calculate_daily_demand
+from src.backend.calculators.capacity import get_zone_capacity
+
+INTERVENTION_CATALOGUE = [
+    {
+        "id": "buffer_30k",
+        "label_nl": "Bufferopslag 30.000 m³",
+        "supply_delta_m3": 30_000,
+        "demand_delta_m3": 0,
+        "cost_eur_low": 15_000_000,
+        "cost_eur_high": 25_000_000,
+        "lead_time_years": 3,
+        "source_url": "https://www.pzh.nl/regiovisie-waterprogramma-2022-2027",
+        "source_label": "Regionaal Waterprogramma ZH 2022–2027",
+        "applicable_types": ["drop_pin", "intake_failure", "multi_hazard"]
+    },
+    {
+        "id": "alt_intake_lek",
+        "label_nl": "Alternatieve inname via de Lek",
+        "supply_delta_m3": 65_000,
+        "demand_delta_m3": 0,
+        "cost_eur_low": 40_000_000,
+        "cost_eur_high": 100_000_000,
+        "lead_time_years": 7,
+        "source_url": "https://www.pzh.nl/regiovisie-waterprogramma-2022-2027",
+        "source_label": "Regionaal Waterprogramma ZH 2022–2027",
+        "applicable_types": ["intake_failure", "multi_hazard"]
+    },
+    {
+        "id": "demand_restriction_10pct",
+        "label_nl": "Vraagbeperking 10% (regelgeving)",
+        "supply_delta_m3": 0,
+        "demand_delta_m3": -0.10,  # fraction of demand
+        "cost_eur_low": 0,
+        "cost_eur_high": 500_000,
+        "lead_time_years": 1,
+        "source_url": "https://wetten.overheid.nl/BWBR0026306",
+        "source_label": "Drinkwaterwet art. 10",
+        "applicable_types": ["drop_pin", "intake_failure", "multi_hazard"]
+    },
+    {
+        "id": "interconnect_neighbor",
+        "label_nl": "Interconnectie buurregio",
+        "supply_delta_m3": 30_000,
+        "demand_delta_m3": 0,
+        "cost_eur_low": 20_000_000,
+        "cost_eur_high": 60_000_000,
+        "lead_time_years": 5,
+        "source_url": "https://www.vewin.nl/publicaties/infrastructuurrapport-2023",
+        "source_label": "VEWIN Infrastructuurrapport 2023",
+        "applicable_types": ["drop_pin", "intake_failure", "multi_hazard"]
+    }
+]
+
+@dataclass
+class RankedIntervention:
+    rank: int
+    intervention_id: str
+    label_nl: str
+    gap_closure_pct: float
+    new_supply_gap_m3: float
+    new_feasibility_class: str
+    cost_range_nl: str
+    lead_time_years: int
+    source_url: str
+    source_label: str
+
+def rank_interventions(
+    current_results: ScenarioResults,
+    params: ScenarioParams
+) -> List[RankedIntervention]:
+    """
+    Iterates through applicable interventions, re-computes feasibility
+    for each, and returns top-3 ranked by gap_closure_pct DESC, cost ASC.
+    Only runs if feasibility_class is STOP or CAUTION.
+    """
+    if current_results.feasibility_class == "GO":
+        return []
+
+    gap = current_results.supply_gap_m3  # negative = shortfall
+    applicable = [
+        i for i in INTERVENTION_CATALOGUE
+        if params.scenario_type in i["applicable_types"]
+    ]
+
+    ranked = []
+    for intv in applicable:
+        # Demand-side intervention (fraction of demand)
+        if intv["demand_delta_m3"] < 0:
+            demand_reduction = abs(intv["demand_delta_m3"]) * current_results.daily_demand_m3
+            new_gap = gap + demand_reduction
+        else:
+            new_gap = gap + intv["supply_delta_m3"]
+
+        if gap < 0:
+            gap_closure_pct = min(100.0, (new_gap - gap) / abs(gap) * 100)
+        else:
+            gap_closure_pct = 0.0
+
+        new_fc = _compute_single_feasibility_class(new_gap)
+        cost_low = intv["cost_eur_low"]
+        cost_high = intv["cost_eur_high"]
+        cost_nl = (
+            f"€{cost_low // 1_000_000:.0f}M – €{cost_high // 1_000_000:.0f}M"
+            if cost_high > 0 else "Regelgevingskosten"
+        )
+
+        ranked.append({
+            "intervention_id": intv["id"],
+            "label_nl": intv["label_nl"],
+            "gap_closure_pct": gap_closure_pct,
+            "new_supply_gap_m3": new_gap,
+            "new_feasibility_class": new_fc,
+            "cost_range_nl": cost_nl,
+            "lead_time_years": intv["lead_time_years"],
+            "source_url": intv["source_url"],
+            "source_label": intv["source_label"]
+        })
+
+    ranked.sort(key=lambda x: (-x["gap_closure_pct"], x["lead_time_years"]))
+
+    return [
+        RankedIntervention(rank=i + 1, **r)
+        for i, r in enumerate(ranked[:3])
+    ]
+
+def _compute_single_feasibility_class(gap: float) -> str:
+    if gap >= 0:
+        return "GO"
+    elif gap >= -10_000:
+        return "CAUTION"
+    else:
+        return "STOP"
+
+Frontend: MakeItFeasiblePanel.vue
+
+vue
+
+<template>
+  <div
+    v-if="interventions.length > 0"
+    class="make-feasible-panel"
+  >
+    <h4>💡 Wat maakt dit wél haalbaar?</h4>
+    <p class="sub">Top-3 interventies, gerangschikt op effectiviteit:</p>
+    <div
+      v-for="intv in interventions"
+      :key="intv.intervention_id"
+      class="intervention-card"
+    >
+      <div class="intv-header">
+        <span class="intv-rank">#{{ intv.rank }}</span>
+        <span class="intv-label">{{ intv.label_nl }}</span>
+        <FeasibilityBadge :feasibility-class="intv.new_feasibility_class" />
+      </div>
+      <div class="intv-details">
+        <div class="detail-row">
+          <span>Sluit {{ intv.gap_closure_pct.toFixed(0) }}% van het tekort</span>
+        </div>
+        <div class="detail-row">
+          <span>Kosten: {{ intv.cost_range_nl }}</span>
+        </div>
+        <div class="detail-row">
+          <span>Doorlooptijd: ~{{ intv.lead_time_years }} jaar</span>
+        </div>
+        <div class="detail-row source-row">
+          <a :href="intv.source_url" target="_blank">
+            📚 {{ intv.source_label }}
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import FeasibilityBadge from './FeasibilityBadge.vue'
+defineProps({
+  interventions: { type: Array, required: true }
+})
+</script>
+
+19.6 GAP 6 — Cumulative load warning (active scenarios in same supply zone)
+Problem
+
+A project developer or spatial planner assessing a new development sees only the isolated impact of their project—not the combined effect with other active scenarios in the same supply zone. This leads to unrealistic feasibility assessments.
+Implementation
+Cumulative load checker (src/backend/nodes/cumulative_load_node.py)
+
+Python
+
+import json
+from src.backend.cache.scenario_store import ScenarioStore
+from src.backend.models.scenario import AgentState
+
+async def check_cumulative_load(state: AgentState) -> AgentState:
+    """
+    Queries the scenario store for all active scenarios whose
+    supply zone overlaps with the current scenario's zone.
+    Computes combined demand and emits a warning if > 0 others found.
+    """
+    current_zone_ids = state["scenario_object"].results.get("affected_zone_ids", [])
+    
+    if not current_zone_ids:
+        state["cumulative_load"] = None
+        return state
+
+    store: ScenarioStore = state["scenario_store"]
+    
+    # Query all cached scenarios for overlapping zones
+    overlapping = store.conn.execute("""
+        SELECT 
+            scenario_id,
+            json_extract(result_json, '$.params.scenario_type') as stype,
+            json_extract(result_json, '$.results.daily_demand_m3') as demand,
+            json_extract(result_json, '$.results.affected_zone_ids') as zones,
+            created_at
+        FROM scenarios
+        WHERE scenario_id != ?
+        AND created_at > now() - INTERVAL 7 DAY
+        ORDER BY created_at DESC
+    """, [state["scenario_id"]]).fetchall()
+
+    active_in_zone = []
+    cumulative_demand = 0.0
+
+    for row in overlapping:
+        row_zones = json.loads(row[3]) if row[3] else []
+        overlap = set(current_zone_ids) & set(row_zones)
+        if overlap:
+            demand = float(row[2]) if row[2] else 0.0
+            active_in_zone.append({
+                "scenario_id": row[0],
+                "scenario_type": row[1],
+                "demand_m3": demand,
+                "overlapping_zones": list(overlap)
+            })
+            cumulative_demand += demand
+
+    if active_in_zone:
+        state["cumulative_load"] = {
+            "active_count": len(active_in_zone),
+            "cumulative_demand_m3": cumulative_demand,
+            "active_scenarios": active_in_zone,
+            "warning_nl": (
+                f"Er zijn {len(active_in_zone)} andere actieve scenario's in "
+                f"deze leveringszone. Gecombineerd extra dagelijks verbruik: "
+                f"{cumulative_demand:,.0f} m³/dag."
+            )
+        }
+    else:
+        state["cumulative_load"] = None
+
+    return state
+
+Frontend: CumulativeLoadWarning.vue
+
+vue
+
+<template>
+  <div
+    v-if="cumulativeLoad"
+    class="cumulative-load-warning"
+  >
+    <div class="warning-header">
+      ⚠️ Gecombineerd effect meerdere scenario's
+    </div>
+    <p>{{ cumulativeLoad.warning_nl }}</p>
+    <details>
+      <summary>
+        Bekijk {{ cumulativeLoad.active_count }} actieve scenario's
+      </summary>
+      <ul>
+        <li
+          v-for="s in cumulativeLoad.active_scenarios"
+          :key="s.scenario_id"
+        >
+          <a :href="`/scenario/${s.scenario_id}`" target="_blank">
+            {{ s.scenario_type }} — {{ s.demand_m3.toLocaleString('nl-NL') }} m³/dag
+          </a>
+          <span class="zone-tags">
+            (zones: {{ s.overlapping_zones.join(', ') }})
+          </span>
+        </li>
+      </ul>
+    </details>
+  </div>
+</template>
+
+<script setup>
+defineProps({
+  cumulativeLoad: { type: Object, default: null }
+})
+</script>
+
+19.7 GAP 7 — Per-intake chloride threshold (not a global constant)
+Problem
+
+Using cl_threshold_mg_l = 150 as a global constant is technically incorrect. Thresholds depend on intake location, treatment technology, and the specific production chain. Water authority engineers will challenge this immediately.
+Implementation
+Per-intake threshold resolution (src/backend/calculators/chloride.py)
+
+Python
+
+def get_intake_chloride_threshold(
+    intake_id: str,
+    conn,
+    fallback_assumption: dict
+) -> dict:
+    """
+    Fetches per-intake chloride threshold from productieketen dataset.
+    Returns threshold value, its source, and whether it came from DB.
+
+    Falls back to assumption (150 mg/L, Drinkwaterbesluit) if not found.
+    The fallback is always explicitly labelled.
+    """
+    row = conn.execute("""
+        SELECT 
+            locatie_id,
+            cl_threshold_mg_l,
+            behandelingstechniek,
+            threshold_source,
+            threshold_last_updated
+        FROM productieketen
+        WHERE locatie_id = ?
+        AND cl_threshold_mg_l IS NOT NULL
+        LIMIT 1
+    """, [intake_id]).fetchone()
+
+    if row and row[1] is not None:
+        return {
+            "threshold_mg_l": float(row[1]),
+            "treatment_tech": row[2],
+            "source": row[3] or "productieketen dataset",
+            "last_updated": row[4],
+            "from_db": True,
+            "is_assumption": False,
+            "assumption_label_nl": None
+        }
+    else:
+        # Explicit fallback with full labelling
+        return {
+            "threshold_mg_l": fallback_assumption["value"],
+            "treatment_tech": "onbekend",
+            "source": fallback_assumption["source_url"],
+            "last_updated": None,
+            "from_db": False,
+            "is_assumption": True,
+            "assumption_label_nl": (
+                f"Drempelwaarde niet gevonden voor inname '{intake_id}' "
+                f"in productieketendataset. "
+                f"Terugvalwaarde gebruikt: {fallback_assumption['value']} mg/L "
+                f"(conservatieve Nederlandse norm, Drinkwaterbesluit). "
+                f"Pas aan via aanname-slider (bandbreedte: 150–250 mg/L)."
+            )
+        }
+
+def calculate_cl_concentration_with_threshold(
+    baseline_cl_mg_l: float,
+    knmi_cl_delta: float,
+    outage_weeks: int,
+    intake_threshold: dict
+) -> dict:
+    """
+    Calculates chloride concentration and compares to per-intake threshold.
+    """
+    effective_cl = baseline_cl_mg_l + knmi_cl_delta
+    if outage_weeks > 0:
+        degradation = 1 + (0.20 * min(outage_weeks, 6))
+        effective_cl *= degradation
+
+    threshold = intake_threshold["threshold_mg_l"]
+    exceeds = effective_cl > threshold
+    margin = threshold - effective_cl  # negative = exceeds threshold
+
+    return {
+        "effective_cl_mg_l": round(effective_cl, 1),
+        "threshold_mg_l": threshold,
+        "threshold_from_db": intake_threshold["from_db"],
+        "threshold_source": intake_threshold["source"],
+        "threshold_is_assumption": intake_threshold["is_assumption"],
+        "threshold_assumption_label_nl": intake_threshold.get("assumption_label_nl"),
+        "exceeds_threshold": exceeds,
+        "margin_mg_l": round(margin, 1),
+        "risk_level": "hoog" if effective_cl > threshold * 1.2 else
+                      "middel" if exceeds else "laag"
+    }
+
+Assumption definition for chloride fallback
+
+Python
+
+# In src/backend/models/assumptions.py — default assumption library
+
+CHLORIDE_THRESHOLD_FALLBACK = Assumption(
+    key="cl_threshold_fallback_mg_l",
+    label_nl="Chloridedrempel inname (terugvalwaarde)",
+    value=150.0,
+    value_min=150.0,
+    value_max=250.0,
+    unit="mg/L",
+    source_url="https://wetten.overheid.nl/BWBR0026304",  # Drinkwaterbesluit
+    source_label="Drinkwaterbesluit (NL norm: 150 mg/L; EU-norm: 250 mg/L)",
+    sensitivity="high",
+    is_policy_approx=True,
+    slider_step=10.0,
+    notes=(
+        "Nederlandse norm (150 mg/L) is conservatiever dan EU-norm (250 mg/L). "
+        "Werkelijke drempel afhankelijk van inname en behandelingstechniek. "
+        "Zie RIVM Tabel 2.3 voor context."
+    )
+)
+
+19.8 GAP 8 — Official position panel (government policy context)
+Problem
+
+If the tool's scenario output appears to contradict official government communications, trust collapses. Every scenario output must anchor itself to the official policy position of the relevant authorities.
+Implementation
+Official position registry (src/backend/registries/official_position_registry.py)
+
+Python
+
+OFFICIAL_POSITIONS = {
+    "drinkwater_zh": {
+        "topic": "drinkwater",
+        "province": "ZH",
+        "summary_nl": (
+            "De beschikbaarheid van voldoende schoon drinkwater in Zuid-Holland staat "
+            "onder druk door bevolkingsgroei, klimaatverandering en bronkwaliteit. "
+            "De provincie werkt samen met drinkwaterbedrijven en waterschappen aan "
+            "een robuuste watervoorziening tot 2040."
+        ),
+        "documents": [
+            {
+                "title": "Regionaal Waterprogramma Zuid-Holland 2022–2027",
+                "url": "https://www.pzh.nl/regiovisie-waterprogramma-2022-2027",
+                "date": "2022",
+                "type": "provinciaal_beleid"
+            },
+            {
+                "title": "Nationaal Waterprogramma 2022–2027",
+                "url": "https://www.rijksoverheid.nl/documenten/rapporten/"
+                       "2022/03/18/nationaal-waterprogramma-2022-2027",
+                "date": "2022",
+                "type": "nationaal_beleid"
+            },
+            {
+                "title": "Ruimtelijk Arrangement Rijk–Zuid-Holland (2 juni 2025)",
+                "url": "https://www.rijksoverheid.nl/documenten/"
+                       "convenanten/2025/06/02/ruimtelijk-arrangement-zh",
+                "date": "2 juni 2025",
+                "type": "rijksbeleid"
+            }
+        ]
+    },
+    "klimaat_knmi": {
+        "topic": "klimaat",
+        "summary_nl": (
+            "KNMI'23 beschrijft vier klimaatscenario's voor Nederland met "
+            "verschillende combinaties van opwarming en verandering in neerslagpatronen. "
+            "Scenario Hd (hoge opwarming, drogere zomers) leidt tot de grootste druk "
+            "op zoetwater­beschikbaarheid."
+        ),
+        "documents": [
+            {
+                "title": "KNMI'23 Klimaatscenario's voor Nederland",
+                "url": "https://www.knmi.nl/kennis-en-datacentrum/achtergrond/"
+                       "knmi-klimaatscenarios-2023",
+                "date": "2023",
+                "type": "wetenschappelijk_beleid"
+            }
+        ]
+    },
+    "woningbouw_zh": {
+        "topic": "woningbouw",
+        "province": "ZH",
+        "summary_nl": (
+            "Zuid-Holland heeft in het Ruimtelijk Arrangement afspraken gemaakt "
+            "over de bouw van circa 235.000 woningen tot 2030. "
+            "Beschikbaarheid van drinkwater is benoemd als randvoorwaarde "
+            "voor ruimtelijke ontwikkeling."
+        ),
+        "documents": [
+            {
+                "title": "Ruimtelijk Arrangement Rijk–Zuid-Holland (2 juni 2025)",
+                "url": "https://www.rijksoverheid.nl/documenten/"
+                       "convenanten/2025/06/02/ruimtelijk-arrangement-zh",
+                "date": "2 juni 2025",
+                "type": "rijksbeleid"
+            },
+            {
+                "title": "Provinciaal Omgevingsbeleid Zuid-Holland",
+                "url": "https://www.pzh.nl/omgevingsbeleid",
+                "date": "2023",
+                "type": "provinciaal_beleid"
+            }
+        ]
+    },
+    "krw": {
+        "topic": "kaderrichtlijn_water",
+        "summary_nl": (
+            "De Kaderrichtlijn Water (KRW) verplicht lidstaten tot het bereiken van "
+            "een goede toestand van alle waterlichamen. De uiterste deadline is "
+            "22 december 2027. Voor Zuid-Holland betekent dit extra druk op "
+            "waterkwaliteit nabij innamepunten en beschermde waterlichamen."
+        ),
+        "documents": [
+            {
+                "title": "Kaderrichtlijn Water — Rijkswaterstaat",
+                "url": "https://www.rijkswaterstaat.nl/water/waterbeheer/"
+                       "bescherming-tegen-het-water/kwaliteit-van-het-water/"
+                       "kaderrichtlijn-water",
+                "date": "2027 deadline",
+                "type": "europees_beleid"
+            }
+        ]
+    }
+}
+
+def get_official_position(
+    scenario_type: str,
+    knmi_preset: str,
+    involves_housing: bool,
+    involves_krw: bool
+) -> dict:
+    """
+    Returns the most relevant official position(s) for a scenario.
+    Always includes drinkwater_zh as the baseline anchor.
+    """
+    positions = [OFFICIAL_POSITIONS["drinkwater_zh"]]
+
+    if knmi_preset in ("Hd", "Hn", "Ld", "Ln"):
+        positions.append(OFFICIAL_POSITIONS["klimaat_knmi"])
+
+    if involves_housing:
+        positions.append(OFFICIAL_POSITIONS["woningbouw_zh"])
+
+    if involves_krw:
+        positions.append(OFFICIAL_POSITIONS["krw"])
+
+    return {
+        "positions": positions,
+        "primary": positions[0],
+        "disclaimer_nl": (
+            "Dit scenario is een beleidsmatige verkenning. Het is geen officieel "
+            "standpunt van de Provincie Zuid-Holland of haar partners."
+        )
+    }
+
+Frontend: OfficialPositionPanel.vue
+
+vue
+
+<template>
+  <div class="official-position-panel">
+    <h4>🏛️ Officieel beleid — Wat zegt de overheid hierover?</h4>
+    <div
+      v-for="pos in officialPosition.positions"
+      :key="pos.topic"
+      class="position-block"
+    >
+      <p class="position-summary">{{ pos.summary_nl }}</p>
+      <ul class="document-list">
+        <li v-for="doc in pos.documents" :key="doc.url">
+          <a :href="doc.url" target="_blank">
+            📄 {{ doc.title }}
+          </a>
+          <span class="doc-date"> ({{ doc.date }})</span>
+        </li>
+      </ul>
+    </div>
+    <p class="disclaimer">
+      ⚠️ {{ officialPosition.disclaimer_nl }}
+    </p>
+  </div>
+</template>
+
+<script setup>
+defineProps({
+  officialPosition: { type: Object, required: true }
+})
+</script>
+
+19.9 GAP 9 — Waterinfo chloride API: mandatory guard for intake scenarios
+
+This is fully implemented in the Waterinfo client specified earlier in Section 13 of the complete document. The following adds the frontend banner component and the SSE event wiring that was referenced but not fully specified.
+Frontend: WaterinfoBanner.vue (complete spec)
+
+vue
+
+<template>
+  <div
+    v-if="waterinfoStatus"
+    :class="['waterinfo-banner', statusClass]"
+  >
+    <span class="status-icon">{{ statusIcon }}</span>
+    <span class="status-message">{{ waterinfoStatus.message_nl }}</span>
+    <span
+      v-if="waterinfoStatus.cached_date"
+      class="cached-date"
+    >
+      Laatste bekende meting: {{ formatDate(waterinfoStatus.cached_date) }}
+    </span>
+    <span
+      v-if="waterinfoStatus.value"
+      class="chloride-value"
+    >
+      Cl⁻: {{ waterinfoStatus.value }} mg/L
+    </span>
+    <a
+      href="https://waterinfo.rws.nl"
+      target="_blank"
+      class="waterinfo-link"
+    >
+      Bekijk live op Waterinfo →
+    </a>
+  </div>
+</template>
+
+<script setup>
+import { computed } from 'vue'
+
+const props = defineProps({
+  waterinfoStatus: { type: Object, default: null }
+})
+
+const statusClass = computed(() => ({
+  'status-live': props.waterinfoStatus?.source === 'Waterinfo live',
+  'status-cached': props.waterinfoStatus?.source === 'Waterinfo (cached)',
+  'status-unavailable': props.waterinfoStatus?.source === 'unavailable'
+}))
+
+const statusIcon = computed(() => {
+  const src = props.waterinfoStatus?.source
+  if (src === 'Waterinfo live') return '🟢'
+  if (src === 'Waterinfo (cached)') return '🟡'
+  return '🔴'
+})
+
+const formatDate = (iso) =>
+  new Date(iso).toLocaleDateString('nl-NL', {
+    day: 'numeric', month: 'long', year: 'numeric'
+  })
+</script>
+
+SSE wiring for waterinfo_status event (src/frontend/composables/useScenarioSSE.ts)
+
+TypeScript
+
+// Add to the existing event switch in useScenarioSSE.ts
+
+case 'waterinfo_status': {
+  const payload = JSON.parse(event.data)
+  waterinfoStore.setStatus({
+    source: payload.source,
+    value: payload.value,
+    cached_date: payload.date,
+    message_nl: payload.warning || 
+      (payload.source === 'Waterinfo live' 
+        ? `Live Waterinfo-meting: ${payload.value} mg/L Cl⁻`
+        : `Gecachede Waterinfo-meting gebruikt (${payload.date}): ${payload.value} mg/L Cl⁻`
+      ),
+    intake_id: payload.intake_id
+  })
+  break
+}
+
+Waterinfo Pinia store (src/frontend/stores/waterinfoStore.ts)
+
+TypeScript
+
+import { defineStore } from 'pinia'
+
+export const useWaterinfoStore = defineStore('waterinfo', {
+  state: () => ({
+    statuses: {} as Record<string, {
+      source: string
+      value: number | null
+      cached_date: string | null
+      message_nl: string
+      intake_id: string
+    }>
+  }),
+  actions: {
+    setStatus(payload: {
+      source: string
+      value: number | null
+      cached_date: string | null
+      message_nl: string
+      intake_id: string
+    }) {
+      this.statuses[payload.intake_id] = payload
+    },
+    clearAll() {
+      this.statuses = {}
+    }
+  },
+  getters: {
+    getStatusForIntake: (state) => (intakeId: string) =>
+      state.statuses[intakeId] || null,
+    hasAnyWarning: (state) =>
+      Object.values(state.statuses).some(
+        s => s.source !== 'Waterinfo live'
+      )
+  }
+})
+
+19.10 GAP 10 — Citizen mode: verdict-first template, postcode detection, water company link
+Problem
+
+Citizens ask "Is mijn water veilig?" not "Wat is het aanvoertekort in m³/dag in leveringszone 4B?" The citizen mode requires a completely different output contract: verdict first, minimal numbers, reassurance context, always link to the responsible water company and official policy.
+Implementation
+Citizen mode detection (src/backend/utils/citizen_detection.py)
+
+Python
+
+import re
+from typing import Literal
+
+CITIZEN_PHRASES = [
+    "mijn water", "ons water", "is het veilig", "kan ik",
+    "drinkwater veilig", "wat betekent dit voor mij",
+    "voor mijn buurt", "bij mij thuis", "in mijn straat"
+]
+
+POSTCODE_REGEX = re.compile(r'\b[1-9][0-9]{3}\s?[A-Za-z]{2}\b')
+
+def detect_citizen_mode(
+    question: str,
+    persona_selection: str | None
+) -> Literal["citizen", "professional"]:
+    """
+    Returns 'citizen' if:
+    - persona_selection == 'burger', OR
+    - question contains citizen phrases, OR
+    - question contains a postcode pattern
+    Returns 'professional' otherwise.
+    """
+    if persona_selection and persona_selection.lower() in ("burger", "citizen"):
+        return "citizen"
+
+    question_lower = question.lower()
+    if any(phrase in question_lower for phrase in CITIZEN_PHRASES):
+        return "citizen"
+
+    if POSTCODE_REGEX.search(question):
+        return "citizen"
+
+    return "professional"
+
+Water company lookup by postcode/zone (src/backend/registries/water_company_registry.py)
+
+Python
+
+WATER_COMPANY_BY_ZONE = {
+    # Leveringszones mapped to responsible drinkwaterbedrijf
+    # Populated from productieketen / leveringszones dataset
+    "dunea": {
+        "name": "Dunea",
+        "url": "https://www.dunea.nl",
+        "phone": "0800-5000 400",
+        "zone_prefixes": ["DUN", "ZH-WEST", "ZH-KUST"],
+        "service_area_nl": "Den Haag, Westland, Zoetermeer en omgeving"
+    },
+    "evides": {
+        "name": "Evides Waterbedrijf",
+        "url": "https://www.evides.nl",
+        "phone": "0900-0929",
+        "zone_prefixes": ["EVI", "ZH-OOST", "ZH-EILANDEN"],
+        "service_area_nl": "Rotterdam, Dordrecht, Zeeland en omgeving"
+    },
+    "oasen": {
+        "name": "Oasen",
+        "url": "https://www.oasen.nl",
+        "phone": "088-0880 100",
+        "zone_prefixes": ["OAS", "ZH-MIDDEN"],
+        "service_area_nl": "Gouda, Alphen aan den Rijn en omgeving"
+    }
+}
+
+def get_water_company_for_zone(zone_id: str) -> dict:
+    """Returns water company info for a leveringszone."""
+    for company_id, company in WATER_COMPANY_BY_ZONE.items():
+        if any(zone_id.upper().startswith(p) for p in company["zone_prefixes"]):
+            return company
+    # Default: return all three if zone unknown
+    return {
+        "name": "Uw drinkwaterbedrijf",
+        "url": "https://www.vewin.nl/drinkwaterbedrijven",
+        "phone": "Zie uw waterbedrijf",
+        "service_area_nl": "Zuid-Holland"
+    }
+
+Citizen formatter node (src/backend/nodes/citizen_formatter_node.py)
+
+Python
+
+import re
+from src.backend.models.scenario import AgentState
+from src.backend.registries.water_company_registry import get_water_company_for_zone
+from src.backend.registries.official_position_registry import OFFICIAL_POSITIONS
+
+CITIZEN_RESPONSE_PROMPT = """
+Je bent een hulpvaardig assistent voor de Provincie Zuid-Holland.
+Schrijf een antwoord voor een burger over drinkwater in hun buurt.
+
+REGELS:
+1. Begin met een VERDICT in één zin (veilig / aandacht nodig / risico).
+2. Schrijf in eenvoudig Nederlands (B1-niveau), max. 100 woorden.
+3. Gebruik GEEN technische termen of m³/dag.
+4. Noem GEEN nieuwe getallen die niet in de invoer staan.
+5. Eindig altijd met een verwijzing naar het drinkwaterbedrijf en officieel beleid.
+6. Voeg altijd de disclaimer toe.
+
+INVOER:
+Vraag: {question}
+Leveringszone: {zone_id}
+Haalbaarheidsklasse: {feasibility_class}
+Verwacht aanvangsjaar risico: {onset_year}
+KNMI-scenario: {knmi_preset}
+Tijdshorizon: {time_horizon}
+
+Schrijf het antwoord als JSON:
+{{
+  "verdict_nl": "...",
+  "explanation_nl": "...",
+  "action_nl": "..."
+}}
+"""
+
+async def format_citizen_response(state: AgentState) -> AgentState:
+    """
+    Generates citizen-mode response using strict template.
+    GreenPT may only generate prose, not new numbers.
+    """
+    results = state["scenario_card"].results
+    params = state["scenario_card"].params
+    zone_id = (results.get("affected_zone_ids") or ["onbekend"])[0]
+    water_company = get_water_company_for_zone(zone_id)
+    postcode = _extract_postcode(state["question"])
+
+    prompt = CITIZEN_RESPONSE_PROMPT.format(
+        question=state["question"],
+        zone_id=zone_id,
+        feasibility_class=results["feasibility_class"],
+        onset_year=results.get("onset_year", "niet bepaald"),
+        knmi_preset=params.knmi_preset,
+        time_horizon=params.time_horizon
+    )
+
+    llm_response = await state["llm"].apredict(prompt)
+    parsed = _parse_json_response(llm_response)
+
+    state["citizen_response"] = {
+        "postcode": postcode,
+        "zone_id": zone_id,
+        "verdict_nl": parsed["verdict_nl"],
+        "explanation_nl": parsed["explanation_nl"],
+        "action_nl": parsed["action_nl"],
+        "water_company": water_company,
+        "official_links": [
+            {
+                "title": doc["title"],
+                "url": doc["url"]
+            }
+            for doc in OFFICIAL_POSITIONS["drinkwater_zh"]["documents"][:2]
+        ],
+        "disclaimer_nl": (
+            "Dit is een exploratief scenario, geen officiële meting. "
+            "Voor officiële informatie, neem contact op met uw drinkwaterbedrijf."
+        ),
+        "knmi_link": {
+            "title": "KNMI Klimaatscenario's",
+            "url": "https://www.knmi.nl/kennis-en-datacentrum/achtergrond/"
+                   "knmi-klimaatscenarios-2023"
+        }
+    }
+    return state
+
+def _extract_postcode(question: str) -> str | None:
+    match = re.search(r'\b([1-9][0-9]{3}\s?[A-Za-z]{2})\b', question)
+    return match.group(1).upper().replace(" ", "") if match else None
+
+Frontend: CitizenResponseCard.vue
+
+vue
+
+<template>
+  <div class="citizen-response-card">
+    <div class="citizen-header">
+      💧 Drinkwater in jouw buurt
+      <span v-if="response.postcode" class="postcode-badge">
+        {{ response.postcode }}
+      </span>
+    </div>
+
+    <div :class="['verdict-block', verdictClass]">
+      {{ response.verdict_nl }}
+    </div>
+
+    <p class="citizen-explanation">{{ response.explanation_nl }}</p>
+    <p class="citizen-action">{{ response.action_nl }}</p>
+
+    <div class="citizen-links">
+      <div class="link-section">
+        <strong>📞 Uw drinkwaterbedrijf:</strong>
+        <a :href="response.water_company.url" target="_blank">
+          {{ response.water_company.name }}
+        </a>
+        <span class="phone">{{ response.water_company.phone }}</span>
+      </div>
+      <div class="link-section">
+        <strong>🏛️ Officieel beleid:</strong>
+        <a
+          v-for="link in response.official_links"
+          :key="link.url"
+          :href="link.url"
+          target="_blank"
+          class="policy-link"
+        >
+          {{ link.title }}
+        </a>
+      </div>
+      <div class="link-section">
+        <a :href="response.knmi_link.url" target="_blank">
+          🌡️ {{ response.knmi_link.title }}
+        </a>
+      </div>
+    </div>
+
+    <p class="citizen-disclaimer">⚠️ {{ response.disclaimer_nl }}</p>
+  </div>
+</template>
+
+<script setup>
+import { computed } from 'vue'
+
+const props = defineProps({
+  response: { type: Object, required: true }
+})
+
+const verdictClass = computed(() => {
+  const v = props.response.verdict_nl?.toLowerCase() || ''
+  if (v.includes('veilig') || v.includes('geen') || v.includes('laag'))
+    return 'verdict-safe'
+  if (v.includes('aandacht') || v.includes('mogelijk'))
+    return 'verdict-caution'
+  return 'verdict-risk'
+})
+</script>
+
+20. Type 2 scenario specification (stretch goal)
+20.1 What Type 2 is
+
+Type 2 is a multi-hazard / cumulative pressure scenario: it combines multiple stressors simultaneously (climate + housing growth + KRW enforcement) to answer "Which combination hits first, and how early?"
+20.2 ScenarioParams extension for Type 2
+
+Python
+
+@dataclass
+class MultiHazardParams:
+    """
+    Additional params for Type 2 scenarios.
+    Stacked on top of base ScenarioParams.
+    """
+    hazard_components: list[str]
+    # e.g. ["climate_hd", "housing_growth_hoog", "krw_2027_enforcement"]
+    
+    # Component weights (0–1, must sum to 1)
+    component_weights: dict[str, float]
+    
+    # "Which combination hits first?" stepping
+    step_years: list[int] = field(
+        default_factory=lambda: [2025, 2027, 2030, 2035, 2040]
+    )
+    
+    # KRW enforcement trigger
+    krw_enforcement_date: str = "2027-12-22"
+    krw_land_use_restriction_pct: float = 0.15  # 15% land-use tightening near intakes
+
+20.3 Compound risk score formula
+
+Python
+
+def calculate_compound_risk_score(
+    demand_gap_m3: float,           # from climate + growth calculation
+    cl_exceedance_pct: float,       # how far above threshold (0 = at threshold)
+    krw_at_risk_count: int,
+    onset_year: int | None,
+    time_horizon: int = 2040
+) -> dict:
+    """
+    Composite risk score 0–100 for multi-hazard scenario.
+    Higher = more risk.
+    """
+    # Demand gap component (0–40 points)
+    gap_score = min(40, abs(demand_gap_m3) / 5000) if demand_gap_m3 < 0 else 0
+
+    # Chloride exceedance (0–30 points)
+    cl_score = min(30, cl_exceedance_pct * 30) if cl_exceedance_pct > 0 else 0
+
+    # KRW risk (0–20 points)
+    krw_score = min(20, krw_at_risk_count * 4)
+
+    # Time urgency (0–10 points)
+    if onset_year:
+        years_remaining = onset_year - 2025
+        urgency_score = max(0, 10 - years_remaining)
+    else:
+        urgency_score = 0
+
+    total = gap_score + cl_score + krw_score + urgency_score
+    risk_level = (
+        "kritiek" if total >= 70 else
+        "hoog" if total >= 50 else
+        "middel" if total >= 30 else
+        "laag"
+    )
+
+    return {
+        "compound_risk_score": round(total, 1),
+        "risk_level": risk_level,
+        "components": {
+            "demand_gap_score": round(gap_score, 1),
+            "chloride_score": round(cl_score, 1),
+            "krw_score": round(krw_score, 1),
+            "urgency_score": round(urgency_score, 1)
+        }
+    }
+
+21. Type 4 scenario specification (stretch goal)
+21.1 What Type 4 is
+
+Type 4 is an intervention effectiveness scenario: given a baseline scenario (typically a STOP or CAUTION result), compare the effect of one or more interventions applied together to find the combination that achieves GO.
+21.2 Intervention stacking logic
+
+Python
+
+def stack_interventions(
+    baseline_results: ScenarioResults,
+    intervention_ids: list[str],
+    params: ScenarioParams
+) -> dict:
+    """
+    Applies multiple interventions cumulatively to a baseline scenario.
+    Interventions are applied in the order given.
+    Returns cumulative effect at each step.
+    """
+    current_gap = baseline_results.supply_gap_m3
+    current_demand = baseline_results.daily_demand_m3
+    steps = []
+
+    for intv_id in intervention_ids:
+        intv = next(
+            (i for i in INTERVENTION_CATALOGUE if i["id"] == intv_id),
+            None
+        )
+        if not intv:
+            continue
+
+        if intv["demand_delta_m3"] < 0:
+            demand_reduction = abs(intv["demand_delta_m3"]) * current_demand
+            current_demand -= demand_reduction
+            current_gap += demand_reduction
+        else:
+            current_gap += intv["supply_delta_m3"]
+
+        steps.append({
+            "after_intervention": intv_id,
+            "label_nl": intv["label_nl"],
+            "cumulative_gap_m3": current_gap,
+            "feasibility_class": _compute_single_feasibility_class(current_gap),
+            "cumulative_cost_low": sum(
+                i["cost_eur_low"]
+                for i in INTERVENTION_CATALOGUE
+                if i["id"] in intervention_ids[:intervention_ids.index(intv_id) + 1]
+            ),
+            "source_url": intv["source_url"],
+            "source_label": intv["source_label"]
+        })
+
+    return {
+        "baseline_gap_m3": baseline_results.supply_gap_m3,
+        "final_gap_m3": current_gap,
+        "final_feasibility_class": _compute_single_feasibility_class(current_gap),
+        "achieves_go": current_gap >= 0,
+        "stacking_steps": steps
+    }
+
+22. Error state catalogue
+
+Every error state must produce a visible, non-technical Dutch message, a suggested next step, and a log entry. No error state should result in a blank screen or an unattributed failure.
+Error code	Trigger	User message (NL)	Suggested action	Logged to
+E001_NO_DATA	DuckDB returns 0 rows for spatial query	"Er zijn geen gegevens beschikbaar voor dit gebied in de geselecteerde datasets."	Broaden the area or choose a different location	MLflow + Insight panel
+E002_GREENPT_TIMEOUT	GreenPT API call > 30s	"De parameterextractie duurde te lang. Probeer de vraag korter te formuleren."	Retry or rephrase	MLflow metric: greenpt_timeout=1
+E003_GREENPT_LOW_CONFIDENCE	Confidence < 0.7 after extraction	"Ik heb de vraag niet helemaal begrepen. Bedoelt u [bevestigingskaart]?"	Show confirmation card with extracted params	Insight panel step
+E004_SCHEMA_MISMATCH	Expected column missing after blocking check	"Een benodigde kolom ontbreekt in de dataset. De berekening gebruikt een terugvalwaarde."	Log missing column, use fallback assumption	MLflow artifact: schema_issues.json
+E005_WATERINFO_UNAVAILABLE	Waterinfo unreachable AND no cache	"Live Waterinfo-data niet beschikbaar en geen gecachede meting gevonden. Chlorideberekening kan niet worden uitgevoerd."	Show warning; skip chloride calculation; proceed with capacity-only result	WaterinfoBanner + MLflow
+E006_ASSUMPTION_MISSING_SOURCE	Assumption has empty source_url	Blocked at build time by AssumptionValidationError	Fix in code before deployment	CI gate
+E007_ZONE_NOT_FOUND	Location geocodes but no leveringszone found	"De locatie kon niet worden gekoppeld aan een leveringszone. De dichtstbijzijnde zone wordt gebruikt."	Use nearest-zone fallback; label result with distance	Insight panel
+E008_HUMAN_SCALE_MISSING	Metric key not in METRIC_CONVERSIONS	"Geen omrekening beschikbaar voor dit getal."	Show link to methodology page	MLflow metric: human_scale_missing_keys
+E009_PDF_GENERATION_FAILED	fpdf2 error during PDF export	"PDF kon niet worden aangemaakt. Download de JSON in plaats daarvan."	Show JSON download fallback	Server log
+E010_SCENARIO_NOT_FOUND	GET /scenario/{id} with unknown ID	"Scenario niet gevonden. Het scenario is mogelijk verlopen of het ID is onjuist."	Link to new scenario run	404 response
+E011_DELTA_INCOMPATIBLE	Scenario A and B have different zone sets	"De twee scenario's zijn niet vergelijkbaar omdat ze betrekking hebben op verschillende zones."	Ask user to confirm or pick a comparison-compatible scenario	Insight panel follow-up
+E012_DUCKDB_QUERY_FAILED	DuckDB runtime error	"De ruimtelijke berekening is mislukt. Probeer het opnieuw."	Retry with simplified query; if fails again, route to E001	MLflow + server log
+23. README template
+
+The following is the template for README.md in the repo root, to be completed before final submission.
+
+Markdown
+
+# OneGov #2 — Drinkwaterzekerheid Scenario Engine
+
+**GovTechNL Hackathon · 4–5 juni 2026 · The Hague Tech**
+
+Een beleidsmatige scenario-engine voor drinkwaterzekerheid in Zuid-Holland 2040,
+gebouwd op de bestaande `onegov2-spatial-assistant` architectuur.
+
+## Wat doet dit?
+
+Stel een what-if vraag in het Nederlands — het systeem extraheert een scenario,
+berekent de gevolgen, en geeft een citeerbare ScenarioCard terug met:
+- 🟢🟡🔴 Haalbaarheidsklasse (GO / RISICO / NIET HAALBAAR)
+- Kaartoverlays per leveringszone
+- Aannames met bronvermeldingen (geen lege links)
+- Stapsgewijs redeneerproces (navolgbaar)
+- Stabiele URL + citaatblok voor adviesdocumenten
+
+## Snelstart
+
+### Vereisten
+- Docker & Docker Compose
+- Python 3.11+
+- Node.js 20+
+- GreenPT API-sleutel
+
+### Installatie
+
+```bash
+git clone https://github.com/knarayanareddy/onegov2.git
+cd onegov2
+cp .env.example .env
+# Vul GREENPT_KEY in .env
+docker-compose up -d
+```
+
+### Data laden
+
+```bash
+cd src/backend
+python scripts/load_data.py         # Laad standaard DuckDB-tabellen
+python scripts/cache_external.py    # Pre-cache KNMI + Waterinfo
+python scripts/blocking_checks.py  # Verifieer schema + H3-joins
+```
+
+### Applicatie starten
+
+```bash
+# Backend
+cd src/backend && uvicorn main:app --reload --port 8000
+
+# Frontend
+cd src/frontend && npm install && npm run dev
+
+# MLflow UI (optioneel)
+mlflow ui --port 5000
+```
+
+Open `http://localhost:5173`
+
+## Voorbeeldvragen
+
+**Scenario A — Drop-a-pin:**
+> "Kan er een 50 MW datacenter komen bij Pijnacker-Nootdorp in 2040?"
+
+**Scenario B — Inname-uitval:**
+> "Wat als de Hollandse IJssel 6 weken onbruikbaar is door verzilting, KNMI Hd, 2040?"
+
+**Vergelijking:**
+> Gebruik de split-kaart om scenario B met en zonder bufferopslag te vergelijken.
+
+## Een scenario reproduceren
+
+Elk scenario heeft een stabiele URL en citaatblok.
+Gebruik de Scenario-ID om een berekening opnieuw op te halen:
+
+```bash
+curl http://localhost:8000/scenario/{scenario_id}
+```
+
+Of herbereken met actuele data:
+
+```bash
+curl -X POST http://localhost:8000/scenario/{scenario_id}/verify
+```
+
+## Architectuur
+
+Zie `docs/architecture.md` voor het volledige diagram.
+
+Kort samengevat:
+- **Frontend:** Vue 3 + Vite + Pinia + Leaflet
+- **Backend:** FastAPI + LangGraph + DuckDB + GreenPT
+- **Traceerbaarheid:** MLflow tracking server
+- **Reproductie:** DuckDB scenario cache + SHA-256 hash
+
+## Databronnen
+
+| Thema | Tabellen | Bron |
+|---|---|---|
+| Drinkwaterzekerheid | productieketen, leveringszones, zes_uur_zones | PDOK / DSO |
+| Gebiedsviewer | verzilting_risico, krw_waterlichamen, e.a. | PDOK |
+| LGN Landgebruik | lgn_grid | WUR / PDOK |
+| CBS Buurten | cbs_buurt (optioneel) | CBS |
+| KNMI Klimaat | Extern gecached | KNMI'23 |
+| Waterinfo | Live API + cache | Rijkswaterstaat |
+
+## Licentie
+MIT — zie `LICENSE`
+
+## Contact
+hack@govtechnl.nl · GovTechNL OneGov #2
+
+24. .env.example
+
+Bash
+
+# =============================================
+# OneGov #2 — Drinkwaterzekerheid Scenario Engine
+# Environment variables — copy to .env and fill in
+# =============================================
+
+# GreenPT LLM
+GREENPT_KEY=your_greenpt_api_key_here
+GREENPT_BASE_URL=https://api.greenpt.ai/v1
+GREENPT_MODEL=gpt-4o
+
+# MLflow
+MLFLOW_TRACKING_URI=http://localhost:5001
+MLFLOW_EXPERIMENT_NAME=onegov2-drinkwater-scenarios
+
+# DuckDB
+DUCKDB_PATH=./data/onegov2.duckdb
+DUCKDB_SCENARIO_CACHE_TTL_DAYS=7
+
+# Waterinfo API (Rijkswaterstaat)
+WATERINFO_API_ENDPOINT=https://waterwebservices.rijkswaterstaat.nl/ONLINEWAARNEMINGENSERVICES_DBO/OphalenWaarnemingen
+WATERINFO_CACHE_PATH=./data/external/waterinfo_cache.json
+# Mandatory intake IDs for chloride guard
+WATERINFO_MANDATORY_INTAKES=IJssel_Gouda,Lek_Bergambacht,Maas_Brakel
+
+# PDOK Geocoder
+PDOK_LOCATIESERVER_URL=https://api.pdok.nl/bzk/locatieserver/search/v3_1/free
+
+# Scenario stable URL base
+SCENARIO_STABLE_URL_BASE=http://localhost:8000
+
+# Determinism
+RANDOM_SEED=42
+NUMPY_SEED=42
+
+# Application
+APP_ENV=development
+LOG_LEVEL=INFO
+CORS_ORIGINS=http://localhost:5173
+
+# Git commit (auto-populated in CI; set manually for local dev)
+GIT_COMMIT=local-dev
+
+25. Build plan with file-level task assignments
+Day 1 — June 4, 2026
+Time	Task	File(s) to create/modify	Owner	Done when
+09:00–09:30	Run blocking checks	scripts/blocking_checks.py	Backend	"All checks passed" printed
+09:30–10:00	Write all dataclasses	src/backend/models/scenario.py, src/backend/models/assumptions.py	Backend	Imports resolve, no errors
+10:00–10:30	Wire AgentState + LangGraph skeleton	src/backend/workflow/graph.py	Backend	Graph compiles with all nodes as stubs
+10:30–11:30	extract_scenario_params node + GreenPT prompt	src/backend/nodes/extract_scenario_params.py	Backend	Golden Path A params extracted correctly
+11:30–12:30	fetch_scenario_data + Waterinfo guard	src/backend/nodes/fetch_scenario_data.py, src/backend/integrations/waterinfo_client.py	Backend	Waterinfo called; fallback warning shown
+12:30–13:00	Lunch + schema verify		All	
+13:00–14:00	run_scenario_calculation — demand + capacity	src/backend/calculators/demand.py, src/backend/calculators/capacity.py	Backend	Golden Path A returns point estimate + range
+14:00–14:30	compute_feasibility_class across KNMI presets	src/backend/calculators/feasibility.py	Backend	GO/CAUTION/STOP returned for all 5 presets
+14:30–15:00	Scenario hash + cache store	src/backend/utils/scenario_hash.py, src/backend/cache/scenario_store.py	Backend	Hash computed; cache write + read verified
+15:00–15:30	POST /scenario/run endpoint + SSE streaming	src/backend/routers/scenario_router.py	Backend	Endpoint streams events to curl test
+15:30–16:30	Frontend SSE wiring + useScenarioStore	src/frontend/stores/scenarioStore.ts, src/frontend/composables/useScenarioSSE.ts	Frontend	Scenario card appears in browser
+16:30–17:00	FeasibilityBadge.vue + AssumptionSliders.vue	src/frontend/components/FeasibilityBadge.vue, src/frontend/components/AssumptionSliders.vue	Frontend	Badge renders; sliders trigger re-run
+17:00–17:30	Golden Path A end-to-end smoke test	All	All	Demo-able: pin → card → feasibility
+17:30–18:30	Chloride calculation + per-intake threshold	src/backend/calculators/chloride.py	Backend	Golden Path B chloride computed with per-intake threshold
+18:30–19:30	KennisbasisPanel.vue + /kennisbasis/status	src/frontend/components/KennisbasisPanel.vue, src/backend/routers/kennisbasis_router.py	Frontend + Backend	Panel shows loaded tables + freshness
+19:30–20:00	CitationBlock.vue + citation builder	src/frontend/components/CitationBlock.vue, src/backend/utils/citation_builder.py	Frontend + Backend	APA citation renders; copy button works
+20:00	Day 1 freeze		All	Both golden paths demo-able; citation block visible
+Day 2 — June 5, 2026
+Time	Task	File(s) to create/modify	Owner	Done when
+09:00–09:30	OfficialPositionPanel.vue + registry	src/frontend/components/OfficialPositionPanel.vue, src/backend/registries/official_position_registry.py	Frontend + Backend	Panel shows 3 policy links
+09:30–10:30	Comparison mode: scenario_b + ScenarioDeltaPanel.vue	src/frontend/components/ScenarioDeltaPanel.vue, extend scenario_router.py	Full stack	Split map + delta panel renders
+10:30–11:00	MakeItFeasiblePanel.vue + intervention ranker	src/frontend/components/MakeItFeasiblePanel.vue, src/backend/calculators/intervention_ranker.py	Full stack	Top-3 interventions shown on STOP scenario
+11:00–11:30	HumanScaleRef.vue + converter	src/frontend/components/HumanScaleRef.vue, src/backend/utils/human_scale.py	Full stack	Every headline metric has analogy + source
+11:30–12:00	Citizen mode detection + CitizenResponseCard.vue	src/backend/utils/citizen_detection.py, src/frontend/components/CitizenResponseCard.vue	Full stack	Citizen question returns verdict-first card
+12:00–12:30	CumulativeLoadWarning.vue + cumulative node	src/frontend/components/CumulativeLoadWarning.vue, src/backend/nodes/cumulative_load_node.py	Full stack	Warning shown for zone with active scenarios
+12:30–13:00	Lunch		All	
+13:00–13:30	ProductionChainFlow.vue (directed flow panel)	src/frontend/components/ProductionChainFlow.vue	Frontend	Intake → production → zone renders for Path B
+13:30–14:00	WaterinfoBanner.vue + Waterinfo store	src/frontend/components/WaterinfoBanner.vue, src/frontend/stores/waterinfoStore.ts	Frontend	Banner shows live vs cached with date
+14:00–14:30	MapTitle.vue + always-visible map header	src/frontend/components/MapTitle.vue, extend MapView.vue	Frontend	Map title updates reactively with scenario
+14:30–15:00	PDF export endpoint	src/backend/routers/scenario_router.py (add /pdf)	Backend	PDF downloads with correct citation block
+15:00–15:30	MLflow logging complete + readability metric	Extend all nodes with mlflow.log_* calls	Backend	MLflow UI shows all runs with metrics
+15:30–16:00	Demo rehearsal — 3-minute script		All	3 "wow moments" land cleanly
+16:00–16:30	README + .env.example finalized	README.md, .env.example	All	README reproduces a scenario from scratch
+16:30–17:00	Open source checklist + final push	LICENSE, README.md, final git push	All	Public repo accessible; submission link ready
+26. Validation & acceptance criteria (pre-submission checklist)
+Must — brief requirement (minimum viable submission)
+
+    Working prototype translates NL policy question into computed scenario
+    ≥ 2 scenario types demonstrated (Type 3 + Type 1)
+    Data, assumptions, and impacted parties explicit in output
+    Open source with readable README
+    Uses provided datasets; no external APIs for core calculation
+    Combines ≥ 2 data themes
+    Existing descriptive workflow still works
+
+Should — design doc requirements
+
+    Comparison mode working: split map + delta panel
+    Assumption sliders adjustable and trigger re-run
+    Reasoning chain traceable: Insight panel + MLflow
+    All source_url fields populated (CI gate blocks empty strings)
+    Human-scale analogies on all headline metrics
+    FeasibilityClass computed across all 5 KNMI presets
+    OnsetYearCalculator steps from 2024 → 2040
+
+Stakeholder gaps — v2 requirements
+
+    GAP 1: Kennisbasis panel present, queryable, shows freshness
+    GAP 2: Scenario hash + stable URL + dataset version logging + version-drift warning
+    GAP 3: Citation block with APA string + PDF download + copy button
+    GAP 4: HumanScaleRef on every headline metric; no empty source URLs
+    GAP 5: "Make it feasible" intervention ranking on STOP/CAUTION
+    GAP 6: Cumulative load warning for same-zone scenarios
+    GAP 7: Per-intake chloride threshold from productieketen; fallback explicitly labelled
+    GAP 8: Official position panel with ≥ 2 policy document links
+    GAP 9: Waterinfo mandatory for IJssel/Lek/Maas; never silent fallback
+    GAP 10: Citizen response template: verdict-first, postcode, water company, disclaimer
+
+Domain correctness
+
+    Chloride threshold is per-intake with source; fallback is slider-adjustable
+    Waterinfo call attempted before every intake scenario; fallback never silent
+    Production chain shows directionality + capacity in directed flow panel
+    All demand figures shown as ranges; labelled "beleidsmatige schatting"
+    Datacenter demand default is midrange (12 m³/day/MW), slider range 5–20 shown
+
+Reproducibility
+
+    Same params → same scenario_hash → same cached result
+    Dataset version drift warning shown on cached scenarios
+    "Verify calculation" button present and functional
+    RANDOM_SEED=42 and NUMPY_SEED=42 set in .env.example
+    git_commit logged in every ScenarioCard
+
+Usability
+
+    All output text in B1 Dutch
+    No scenario returns a blank screen (all errors produce Dutch message + next step)
+    Map always shows title and legend
+    FeasibilityBadge visible before any numbers
+    Demo runs without internet (all external data pre-cached)
